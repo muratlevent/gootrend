@@ -334,7 +334,7 @@ def show_banner():
     console.print()
     console.print(
         Panel(
-            "[bold white]🔍  Google Trends LinkedIn Keywords Scraper[/bold white]\n"
+            "[bold white]🔍  Google Trends Keywords Scraper[/bold white]\n"
             f"[dim]{len(SEED_KEYWORDS)} seeds  •  {len(CATEGORIES)} categories  •  {len(GEOS)} geos[/dim]",
             border_style="cyan",
             padding=(1, 3),
