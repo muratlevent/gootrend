@@ -1,3 +1,4 @@
 pytrends
 pandas
 rich
+urllib3<2.0
