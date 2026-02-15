@@ -181,10 +181,10 @@ SEED_KEYWORDS = [
 ]
 
 # Rate limiting
-MIN_DELAY = 3
-MAX_DELAY = 7
+MIN_DELAY = 10
+MAX_DELAY = 20
 RETRY_DELAY = 60
-MAX_RETRIES = 5
+MAX_RETRIES = 3
 
 # Save checkpoint every N combos
 SAVE_EVERY = 50
