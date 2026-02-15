@@ -426,11 +426,22 @@ def wait_between_requests():
     time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
 
-def safe_request(func, *args, retries=MAX_RETRIES, **kwargs):
-    """Call a pytrends function with retry logic."""
+def safe_request(func, *args, setup=None, retries=MAX_RETRIES, pytrends_ref=None, **kwargs):
+    """Call a pytrends function with retry logic.
+
+    Args:
+        func:   The pytrends method to call (e.g. pytrends.related_queries).
+        setup:  Optional callable to run before *func* on every attempt
+                (e.g. pytrends.build_payload).  This ensures the token-fetch
+                is also retried when Google returns 400.
+        pytrends_ref: Optional TrendReq instance. If provided, a fresh cookie
+                will be fetched on 400 errors before retrying.
+    """
     for attempt in range(1, retries + 1):
         try:
             wait_between_requests()
+            if setup is not None:
+                setup()
             return func(*args, **kwargs)
         except Exception as e:
             err = str(e)
@@ -440,6 +451,16 @@ def safe_request(func, *args, retries=MAX_RETRIES, **kwargs):
                 time.sleep(wait)
             elif "response is empty" in err.lower() or "no data" in err.lower():
                 return None
+            elif "400" in err:
+                # 400 errors are usually transient cookie/token issues
+                if attempt < retries:
+                    log.debug(f"Transient 400 (attempt {attempt}/{retries}), refreshing session…")
+                    if pytrends_ref is not None:
+                        pytrends_ref.cookies = pytrends_ref.GetGoogleCookie()
+                    time.sleep(random.uniform(5, 15))
+                else:
+                    log.info(f"Skipping after {retries} attempts (400 error)")
+                    return None  # skip this combo instead of crashing
             else:
                 log.warning(f"Error (attempt {attempt}/{retries}): {err[:120]}")
                 if attempt < retries:
@@ -450,7 +471,13 @@ def safe_request(func, *args, retries=MAX_RETRIES, **kwargs):
 
 
 def create_pytrends():
-    return TrendReq(hl="en-US", tz=0, retries=3, backoff_factor=1)
+    """Create a new TrendReq session.
+
+    We set retries=0 and backoff_factor=0 to disable pytrends' internal
+    retry mechanism (which uses the deprecated `method_whitelist` kwarg
+    on newer urllib3 versions).  All retries are handled by safe_request().
+    """
+    return TrendReq(hl="en-US", tz=0, timeout=(10, 30), retries=0, backoff_factor=0)
 
 
 def create_progress() -> Progress:
@@ -509,8 +536,12 @@ def scrape_related_queries(checkpoint: Checkpoint, timeframes: dict):
                             continue
 
                         try:
-                            pytrends.build_payload([kw], cat=cat_id, timeframe=tf, geo=geo_code)
-                            data = safe_request(pytrends.related_queries)
+                            data = safe_request(
+                                pytrends.related_queries,
+                                setup=lambda _kw=kw, _cat=cat_id, _tf=tf, _geo=geo_code:
+                                    pytrends.build_payload([_kw], cat=_cat, timeframe=_tf, geo=_geo),
+                                pytrends_ref=pytrends,
+                            )
                             if data and kw in data:
                                 for qtype in ("top", "rising"):
                                     df = data[kw].get(qtype)
@@ -578,8 +609,12 @@ def scrape_related_topics(checkpoint: Checkpoint, timeframes: dict):
                             continue
 
                         try:
-                            pytrends.build_payload([kw], cat=cat_id, timeframe=tf, geo=geo_code)
-                            data = safe_request(pytrends.related_topics)
+                            data = safe_request(
+                                pytrends.related_topics,
+                                setup=lambda _kw=kw, _cat=cat_id, _tf=tf, _geo=geo_code:
+                                    pytrends.build_payload([_kw], cat=_cat, timeframe=_tf, geo=_geo),
+                                pytrends_ref=pytrends,
+                            )
                             if data and kw in data:
                                 for ttype in ("top", "rising"):
                                     df = data[kw].get(ttype)
@@ -641,7 +676,7 @@ def scrape_trending_rss(checkpoint: Checkpoint, _timeframes: dict):
                 continue
             pn = geo_code or "US"
             try:
-                df = safe_request(pytrends.trending_searches, pn=pn)
+                df = safe_request(pytrends.trending_searches, pn=pn, pytrends_ref=pytrends)
                 if df is not None and not df.empty:
                     for _, row in df.iterrows():
                         results.append({
@@ -662,7 +697,10 @@ def scrape_trending_rss(checkpoint: Checkpoint, _timeframes: dict):
                 continue
             pn = geo_code or "US"
             try:
-                df = safe_request(pytrends.realtime_trending_searches, pn=pn)
+                df = safe_request(
+                    pytrends.realtime_trending_searches, pn=pn,
+                    pytrends_ref=pytrends,
+                )
                 if df is not None and not df.empty:
                     for _, row in df.iterrows():
                         title = row.get("title", row.get("entityNames", ""))
@@ -719,10 +757,13 @@ def scrape_category_trends(checkpoint: Checkpoint, timeframes: dict):
                     continue
 
                 try:
-                    pytrends.build_payload(
-                        category_anchors[:5], cat=cat_id,
-                        timeframe=default_tf, geo=geo_code,
-                    )
+                    try:
+                        pytrends.build_payload(
+                            category_anchors[:5], cat=cat_id,
+                            timeframe=default_tf, geo=geo_code,
+                        )
+                    except Exception:
+                        pass  # payload build may fail; suggestions still work independently
                     for anchor in category_anchors[:5]:
                         try:
                             suggestions = pytrends.suggestions(anchor)
