@@ -70,9 +70,6 @@ TIMEFRAMES = {
 GEOS = {
     "":   "Global",
     "US": "United States",
-    "GB": "United Kingdom",
-    "CA": "Canada",
-    "AU": "Australia",
 }
 
 CATEGORIES = {
@@ -187,10 +184,16 @@ SEED_KEYWORDS = [
 MIN_DELAY = 3
 MAX_DELAY = 7
 RETRY_DELAY = 60
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 
 # Save checkpoint every N combos
 SAVE_EVERY = 50
+
+# Refresh TrendReq session every N requests to avoid stale cookies
+SESSION_REFRESH_EVERY = 100
+
+# Keyword batch size (pytrends supports up to 5)
+KW_BATCH_SIZE = 5
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +285,8 @@ class Checkpoint:
 
     def print_status(self, timeframes: dict):
         num_tf = max(len(timeframes), 1)
-        combo_total = len(SEED_KEYWORDS) * len(GEOS) * len(CATEGORIES) * num_tf
+        kw_batches = len(batch_keywords(SEED_KEYWORDS))
+        combo_total = kw_batches * len(GEOS) * len(CATEGORIES) * num_tf
 
         tbl = Table(
             title="📊 Checkpoint Status", box=box.ROUNDED,
@@ -412,8 +416,10 @@ def show_config_summary(timeframes: dict):
     tbl.add_row("Seeds", str(len(SEED_KEYWORDS)))
     tbl.add_row("Categories", str(len(CATEGORIES)))
     tbl.add_row("Geos", str(len(GEOS)))
-    combo = len(SEED_KEYWORDS) * len(GEOS) * len(CATEGORIES) * len(timeframes)
-    tbl.add_row("Phase 1/2 combos", f"{combo:,}")
+    tbl.add_row("Batch size", str(KW_BATCH_SIZE))
+    kw_batches = len(batch_keywords(SEED_KEYWORDS))
+    combo = kw_batches * len(GEOS) * len(CATEGORIES) * len(timeframes)
+    tbl.add_row("Phase 1/2 batched combos", f"{combo:,}")
     console.print(Panel(tbl, title="[bold]Configuration[/bold]", border_style="dim", padding=(0, 1)))
     console.print()
 
@@ -503,7 +509,16 @@ def _save_csv(records: list, path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 – Related Queries
+# Helpers – keyword batching
+# ---------------------------------------------------------------------------
+
+def batch_keywords(keywords: list, size: int = KW_BATCH_SIZE) -> list[list[str]]:
+    """Split keywords into batches of *size* (max 5 for pytrends)."""
+    return [keywords[i:i + size] for i in range(0, len(keywords), size)]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 – Related Queries  (batched: up to 5 keywords per API call)
 # ---------------------------------------------------------------------------
 
 def scrape_related_queries(checkpoint: Checkpoint, timeframes: dict):
@@ -515,51 +530,64 @@ def scrape_related_queries(checkpoint: Checkpoint, timeframes: dict):
         results = pd.read_csv(csv_path).to_dict("records")
 
     pytrends = create_pytrends()
-    total = len(SEED_KEYWORDS) * len(GEOS) * len(CATEGORIES) * len(timeframes)
+    kw_batches = batch_keywords(SEED_KEYWORDS)
 
-    # Pre-count completed
+    # Total = batches × geos × categories × timeframes
+    total = len(kw_batches) * len(GEOS) * len(CATEGORIES) * len(timeframes)
+
+    # Pre-count completed batches
     skip = sum(
         1 for k in checkpoint.data.get("completed_related_queries", set())
         if k.rsplit("|", 1)[-1] in timeframes
     )
 
     counter = 0
+    request_count = 0
     with create_progress() as prog:
         task = prog.add_task("Related Queries", total=total, completed=skip)
 
         for tf, tf_label in timeframes.items():
-            for kw in SEED_KEYWORDS:
+            for batch in kw_batches:
+                batch_key = "+".join(batch)  # e.g. "linkedin+linkedin strategy+..."
                 for geo_code, geo_name in GEOS.items():
                     for cat_id, cat_name in CATEGORIES.items():
-                        combo = f"{kw}|{geo_code}|{cat_id}|{tf}"
+                        combo = f"{batch_key}|{geo_code}|{cat_id}|{tf}"
                         if checkpoint.is_done("completed_related_queries", combo):
                             continue
+
+                        # Refresh session periodically
+                        request_count += 1
+                        if request_count % SESSION_REFRESH_EVERY == 0:
+                            pytrends = create_pytrends()
+                            log.debug("Session refreshed")
 
                         try:
                             data = safe_request(
                                 pytrends.related_queries,
-                                setup=lambda _kw=kw, _cat=cat_id, _tf=tf, _geo=geo_code:
-                                    pytrends.build_payload([_kw], cat=_cat, timeframe=_tf, geo=_geo),
+                                setup=lambda _kws=batch, _cat=cat_id, _tf=tf, _geo=geo_code:
+                                    pytrends.build_payload(_kws, cat=_cat, timeframe=_tf, geo=_geo),
                                 pytrends_ref=pytrends,
                             )
-                            if data and kw in data:
-                                for qtype in ("top", "rising"):
-                                    df = data[kw].get(qtype)
-                                    if df is not None and not df.empty:
-                                        for _, row in df.iterrows():
-                                            results.append({
-                                                "seed_keyword": kw,
-                                                "geo": geo_code or "Global",
-                                                "geo_name": geo_name,
-                                                "category_id": cat_id,
-                                                "category_name": cat_name,
-                                                "timeframe": tf,
-                                                "timeframe_label": tf_label,
-                                                "type": qtype,
-                                                "query": row.get("query", ""),
-                                                "value": row.get("value", ""),
-                                            })
-                                        checkpoint.incr_stat("total_related_queries_found", len(df))
+                            if data:
+                                for kw in batch:
+                                    if kw in data:
+                                        for qtype in ("top", "rising"):
+                                            df = data[kw].get(qtype)
+                                            if df is not None and not df.empty:
+                                                for _, row in df.iterrows():
+                                                    results.append({
+                                                        "seed_keyword": kw,
+                                                        "geo": geo_code or "Global",
+                                                        "geo_name": geo_name,
+                                                        "category_id": cat_id,
+                                                        "category_name": cat_name,
+                                                        "timeframe": tf,
+                                                        "timeframe_label": tf_label,
+                                                        "type": qtype,
+                                                        "query": row.get("query", ""),
+                                                        "value": row.get("value", ""),
+                                                    })
+                                                checkpoint.incr_stat("total_related_queries_found", len(df))
                         except Exception as e:
                             checkpoint.log_error(f"rq|{combo}", str(e))
 
@@ -577,7 +605,7 @@ def scrape_related_queries(checkpoint: Checkpoint, timeframes: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 – Related Topics
+# Phase 2 – Related Topics  (batched: up to 5 keywords per API call)
 # ---------------------------------------------------------------------------
 
 def scrape_related_topics(checkpoint: Checkpoint, timeframes: dict):
@@ -589,7 +617,9 @@ def scrape_related_topics(checkpoint: Checkpoint, timeframes: dict):
         results = pd.read_csv(csv_path).to_dict("records")
 
     pytrends = create_pytrends()
-    total = len(SEED_KEYWORDS) * len(GEOS) * len(CATEGORIES) * len(timeframes)
+    kw_batches = batch_keywords(SEED_KEYWORDS)
+
+    total = len(kw_batches) * len(GEOS) * len(CATEGORIES) * len(timeframes)
 
     skip = sum(
         1 for k in checkpoint.data.get("completed_related_topics", set())
@@ -597,44 +627,53 @@ def scrape_related_topics(checkpoint: Checkpoint, timeframes: dict):
     )
 
     counter = 0
+    request_count = 0
     with create_progress() as prog:
         task = prog.add_task("Related Topics", total=total, completed=skip)
 
         for tf, tf_label in timeframes.items():
-            for kw in SEED_KEYWORDS:
+            for batch in kw_batches:
+                batch_key = "+".join(batch)
                 for geo_code, geo_name in GEOS.items():
                     for cat_id, cat_name in CATEGORIES.items():
-                        combo = f"{kw}|{geo_code}|{cat_id}|{tf}"
+                        combo = f"{batch_key}|{geo_code}|{cat_id}|{tf}"
                         if checkpoint.is_done("completed_related_topics", combo):
                             continue
+
+                        request_count += 1
+                        if request_count % SESSION_REFRESH_EVERY == 0:
+                            pytrends = create_pytrends()
+                            log.debug("Session refreshed")
 
                         try:
                             data = safe_request(
                                 pytrends.related_topics,
-                                setup=lambda _kw=kw, _cat=cat_id, _tf=tf, _geo=geo_code:
-                                    pytrends.build_payload([_kw], cat=_cat, timeframe=_tf, geo=_geo),
+                                setup=lambda _kws=batch, _cat=cat_id, _tf=tf, _geo=geo_code:
+                                    pytrends.build_payload(_kws, cat=_cat, timeframe=_tf, geo=_geo),
                                 pytrends_ref=pytrends,
                             )
-                            if data and kw in data:
-                                for ttype in ("top", "rising"):
-                                    df = data[kw].get(ttype)
-                                    if df is not None and not df.empty:
-                                        for _, row in df.iterrows():
-                                            results.append({
-                                                "seed_keyword": kw,
-                                                "geo": geo_code or "Global",
-                                                "geo_name": geo_name,
-                                                "category_id": cat_id,
-                                                "category_name": cat_name,
-                                                "timeframe": tf,
-                                                "timeframe_label": tf_label,
-                                                "type": ttype,
-                                                "topic_title": row.get("topic_title", ""),
-                                                "topic_mid": row.get("topic_mid", ""),
-                                                "topic_type": row.get("topic_type", ""),
-                                                "value": row.get("value", ""),
-                                            })
-                                        checkpoint.incr_stat("total_related_topics_found", len(df))
+                            if data:
+                                for kw in batch:
+                                    if kw in data:
+                                        for ttype in ("top", "rising"):
+                                            df = data[kw].get(ttype)
+                                            if df is not None and not df.empty:
+                                                for _, row in df.iterrows():
+                                                    results.append({
+                                                        "seed_keyword": kw,
+                                                        "geo": geo_code or "Global",
+                                                        "geo_name": geo_name,
+                                                        "category_id": cat_id,
+                                                        "category_name": cat_name,
+                                                        "timeframe": tf,
+                                                        "timeframe_label": tf_label,
+                                                        "type": ttype,
+                                                        "topic_title": row.get("topic_title", ""),
+                                                        "topic_mid": row.get("topic_mid", ""),
+                                                        "topic_type": row.get("topic_type", ""),
+                                                        "value": row.get("value", ""),
+                                                    })
+                                                checkpoint.incr_stat("total_related_topics_found", len(df))
                         except Exception as e:
                             checkpoint.log_error(f"rt|{combo}", str(e))
 
