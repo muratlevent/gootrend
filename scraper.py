@@ -202,7 +202,6 @@ KW_BATCH_SIZE = 5
 
 _SECTION_KEYS = [
     "completed_related_queries",
-    "completed_trending_rss",
     "completed_category_trends",
 ]
 
@@ -222,12 +221,10 @@ class Checkpoint:
             "last_updated": None,
             "selected_timeframes": [],
             "completed_related_queries": set(),
-            "completed_trending_rss": set(),
             "completed_category_trends": set(),
             "errors": [],
             "stats": {
                 "total_related_queries_found": 0,
-                "total_trending_found": 0,
                 "total_category_trends_found": 0,
             },
         }
@@ -300,12 +297,9 @@ class Checkpoint:
             return "🔄" if done > 0 else "⬜"
 
         rq = len(self.data.get("completed_related_queries", set()))
-        rss = len(self.data.get("completed_trending_rss", set()))
         ct = len(self.data.get("completed_category_trends", set()))
-        rss_total = len(GEOS) * 2
 
         tbl.add_row("Related Queries", f"{rq:,}", f"{combo_total:,}", icon(rq, combo_total))
-        tbl.add_row("Trending RSS", f"{rss:,}", f"{rss_total:,}", icon(rss, rss_total))
         tbl.add_row("Category Trends", f"{ct:,}", f"{len(GEOS)*len(CATEGORIES):,}", icon(ct, len(GEOS)*len(CATEGORIES)))
         console.print()
         console.print(tbl)
@@ -600,83 +594,12 @@ def scrape_related_queries(checkpoint: Checkpoint, timeframes: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 – Trending RSS  (real-time, no timeframe dimension)
 # ---------------------------------------------------------------------------
-
-def scrape_trending_rss(checkpoint: Checkpoint, _timeframes: dict):
-    console.rule("[bold cyan]Phase 2 — Real-Time Trending Searches[/bold cyan]")
-
-    results = []
-    csv_path = OUTPUT_DIR / "trending_searches.csv"
-    if csv_path.exists():
-        results = pd.read_csv(csv_path).to_dict("records")
-
-    pytrends = create_pytrends()
-    total = len(GEOS) * 2  # daily + realtime per geo
-
-    skip = len(checkpoint.data.get("completed_trending_rss", set()))
-    with create_progress() as prog:
-        task = prog.add_task("Trending RSS", total=total, completed=skip)
-
-        # -- daily trending --
-        for geo_code, geo_name in GEOS.items():
-            if checkpoint.is_done("completed_trending_rss", geo_code):
-                continue
-            pn = geo_code or "US"
-            try:
-                df = safe_request(pytrends.trending_searches, pn=pn, pytrends_ref=pytrends)
-                if df is not None and not df.empty:
-                    for _, row in df.iterrows():
-                        results.append({
-                            "geo": geo_code or "Global",
-                            "geo_name": geo_name,
-                            "trending_keyword": row.iloc[0] if len(row) > 0 else "",
-                        })
-                    checkpoint.incr_stat("total_trending_found", len(df))
-            except Exception as e:
-                checkpoint.log_error(f"trending|{geo_code}", str(e))
-            checkpoint.mark_done("completed_trending_rss", geo_code)
-            prog.advance(task)
-
-        # -- realtime trending --
-        for geo_code, geo_name in GEOS.items():
-            rss_key = f"realtime_{geo_code}"
-            if checkpoint.is_done("completed_trending_rss", rss_key):
-                continue
-            pn = geo_code or "US"
-            try:
-                df = safe_request(
-                    pytrends.realtime_trending_searches, pn=pn,
-                    pytrends_ref=pytrends,
-                )
-                if df is not None and not df.empty:
-                    for _, row in df.iterrows():
-                        title = row.get("title", row.get("entityNames", ""))
-                        if isinstance(title, list):
-                            title = ", ".join(title)
-                        results.append({
-                            "geo": geo_code or "Global",
-                            "geo_name": geo_name,
-                            "trending_keyword": str(title),
-                        })
-                    checkpoint.incr_stat("total_trending_found", len(df))
-            except Exception as e:
-                checkpoint.log_error(f"realtime|{geo_code}", str(e))
-            checkpoint.mark_done("completed_trending_rss", rss_key)
-            prog.advance(task)
-
-    _save_csv(results, csv_path)
-    checkpoint.save()
-    log.info(f"Trending searches: {len(results):,} rows saved")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Phase 3 – Category Trends  (suggestions API is timeframe-independent)
+# Phase 2 – Category Trends  (suggestions API is timeframe-independent)
 # ---------------------------------------------------------------------------
 
 def scrape_category_trends(checkpoint: Checkpoint, timeframes: dict):
-    console.rule("[bold cyan]Phase 3 — Category-Based Trends[/bold cyan]")
+    console.rule("[bold cyan]Phase 2 — Category-Based Trends[/bold cyan]")
 
     results = []
     csv_path = OUTPUT_DIR / "category_trends.csv"
@@ -748,16 +671,15 @@ def scrape_category_trends(checkpoint: Checkpoint, timeframes: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 – Master Keywords Aggregation
+# Phase 3 – Master Keywords Aggregation
 # ---------------------------------------------------------------------------
 
 def build_master_keywords(checkpoint: Checkpoint):
-    console.rule("[bold cyan]Phase 4 — Building Master Keywords List[/bold cyan]")
+    console.rule("[bold cyan]Phase 3 — Building Master Keywords List[/bold cyan]")
     all_kw: set[str] = set()
 
     sources = [
         ("related_queries.csv",  "query"),
-        ("trending_searches.csv","trending_keyword"),
         ("category_trends.csv",  "suggestion_title"),
     ]
 
@@ -795,7 +717,7 @@ def build_master_keywords(checkpoint: Checkpoint):
 def _run():
     parser = argparse.ArgumentParser(description="Google Trends LinkedIn Keywords Scraper")
     parser.add_argument("--status", action="store_true", help="Show checkpoint progress")
-    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4],
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3],
                         help="Run only a specific phase")
     args = parser.parse_args()
 
@@ -840,12 +762,11 @@ def _run():
     # -- run phases ----------------------------------------------------------
     phases = {
         1: ("Related Queries", scrape_related_queries),
-        2: ("Trending RSS",    scrape_trending_rss),
-        3: ("Category Trends", scrape_category_trends),
+        2: ("Category Trends", scrape_category_trends),
     }
 
     if args.phase:
-        if args.phase == 4:
+        if args.phase == 3:
             build_master_keywords(checkpoint)
         elif args.phase in phases:
             name, func = phases[args.phase]
