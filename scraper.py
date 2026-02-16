@@ -202,7 +202,6 @@ KW_BATCH_SIZE = 5
 
 _SECTION_KEYS = [
     "completed_related_queries",
-    "completed_related_topics",
     "completed_trending_rss",
     "completed_category_trends",
 ]
@@ -223,13 +222,11 @@ class Checkpoint:
             "last_updated": None,
             "selected_timeframes": [],
             "completed_related_queries": set(),
-            "completed_related_topics": set(),
             "completed_trending_rss": set(),
             "completed_category_trends": set(),
             "errors": [],
             "stats": {
                 "total_related_queries_found": 0,
-                "total_related_topics_found": 0,
                 "total_trending_found": 0,
                 "total_category_trends_found": 0,
             },
@@ -303,13 +300,11 @@ class Checkpoint:
             return "🔄" if done > 0 else "⬜"
 
         rq = len(self.data.get("completed_related_queries", set()))
-        rt = len(self.data.get("completed_related_topics", set()))
         rss = len(self.data.get("completed_trending_rss", set()))
         ct = len(self.data.get("completed_category_trends", set()))
         rss_total = len(GEOS) * 2
 
         tbl.add_row("Related Queries", f"{rq:,}", f"{combo_total:,}", icon(rq, combo_total))
-        tbl.add_row("Related Topics", f"{rt:,}", f"{combo_total:,}", icon(rt, combo_total))
         tbl.add_row("Trending RSS", f"{rss:,}", f"{rss_total:,}", icon(rss, rss_total))
         tbl.add_row("Category Trends", f"{ct:,}", f"{len(GEOS)*len(CATEGORIES):,}", icon(ct, len(GEOS)*len(CATEGORIES)))
         console.print()
@@ -419,7 +414,7 @@ def show_config_summary(timeframes: dict):
     tbl.add_row("Batch size", str(KW_BATCH_SIZE))
     kw_batches = len(batch_keywords(SEED_KEYWORDS))
     combo = kw_batches * len(GEOS) * len(CATEGORIES) * len(timeframes)
-    tbl.add_row("Phase 1/2 batched combos", f"{combo:,}")
+    tbl.add_row("Phase 1 batched combos", f"{combo:,}")
     console.print(Panel(tbl, title="[bold]Configuration[/bold]", border_style="dim", padding=(0, 1)))
     console.print()
 
@@ -605,97 +600,11 @@ def scrape_related_queries(checkpoint: Checkpoint, timeframes: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 – Related Topics  (batched: up to 5 keywords per API call)
-# ---------------------------------------------------------------------------
-
-def scrape_related_topics(checkpoint: Checkpoint, timeframes: dict):
-    console.rule("[bold cyan]Phase 2 — Related Topics[/bold cyan]")
-
-    results = []
-    csv_path = OUTPUT_DIR / "related_topics.csv"
-    if csv_path.exists():
-        results = pd.read_csv(csv_path).to_dict("records")
-
-    pytrends = create_pytrends()
-    kw_batches = batch_keywords(SEED_KEYWORDS)
-
-    total = len(kw_batches) * len(GEOS) * len(CATEGORIES) * len(timeframes)
-
-    skip = sum(
-        1 for k in checkpoint.data.get("completed_related_topics", set())
-        if k.rsplit("|", 1)[-1] in timeframes
-    )
-
-    counter = 0
-    request_count = 0
-    with create_progress() as prog:
-        task = prog.add_task("Related Topics", total=total, completed=skip)
-
-        for tf, tf_label in timeframes.items():
-            for batch in kw_batches:
-                batch_key = "+".join(batch)
-                for geo_code, geo_name in GEOS.items():
-                    for cat_id, cat_name in CATEGORIES.items():
-                        combo = f"{batch_key}|{geo_code}|{cat_id}|{tf}"
-                        if checkpoint.is_done("completed_related_topics", combo):
-                            continue
-
-                        request_count += 1
-                        if request_count % SESSION_REFRESH_EVERY == 0:
-                            pytrends = create_pytrends()
-                            log.debug("Session refreshed")
-
-                        try:
-                            data = safe_request(
-                                pytrends.related_topics,
-                                setup=lambda _kws=batch, _cat=cat_id, _tf=tf, _geo=geo_code:
-                                    pytrends.build_payload(_kws, cat=_cat, timeframe=_tf, geo=_geo),
-                                pytrends_ref=pytrends,
-                            )
-                            if data:
-                                for kw in batch:
-                                    if kw in data:
-                                        for ttype in ("top", "rising"):
-                                            df = data[kw].get(ttype)
-                                            if df is not None and not df.empty:
-                                                for _, row in df.iterrows():
-                                                    results.append({
-                                                        "seed_keyword": kw,
-                                                        "geo": geo_code or "Global",
-                                                        "geo_name": geo_name,
-                                                        "category_id": cat_id,
-                                                        "category_name": cat_name,
-                                                        "timeframe": tf,
-                                                        "timeframe_label": tf_label,
-                                                        "type": ttype,
-                                                        "topic_title": row.get("topic_title", ""),
-                                                        "topic_mid": row.get("topic_mid", ""),
-                                                        "topic_type": row.get("topic_type", ""),
-                                                        "value": row.get("value", ""),
-                                                    })
-                                                checkpoint.incr_stat("total_related_topics_found", len(df))
-                        except Exception as e:
-                            checkpoint.log_error(f"rt|{combo}", str(e))
-
-                        checkpoint.mark_done("completed_related_topics", combo)
-                        prog.advance(task)
-                        counter += 1
-                        if counter % SAVE_EVERY == 0:
-                            _save_csv(results, csv_path)
-                            checkpoint.save()
-
-    _save_csv(results, csv_path)
-    checkpoint.save()
-    log.info(f"Related topics: {len(results):,} rows saved")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Phase 3 – Trending RSS  (real-time, no timeframe dimension)
+# Phase 2 – Trending RSS  (real-time, no timeframe dimension)
 # ---------------------------------------------------------------------------
 
 def scrape_trending_rss(checkpoint: Checkpoint, _timeframes: dict):
-    console.rule("[bold cyan]Phase 3 — Real-Time Trending Searches[/bold cyan]")
+    console.rule("[bold cyan]Phase 2 — Real-Time Trending Searches[/bold cyan]")
 
     results = []
     csv_path = OUTPUT_DIR / "trending_searches.csv"
@@ -763,11 +672,11 @@ def scrape_trending_rss(checkpoint: Checkpoint, _timeframes: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 – Category Trends  (suggestions API is timeframe-independent)
+# Phase 3 – Category Trends  (suggestions API is timeframe-independent)
 # ---------------------------------------------------------------------------
 
 def scrape_category_trends(checkpoint: Checkpoint, timeframes: dict):
-    console.rule("[bold cyan]Phase 4 — Category-Based Trends[/bold cyan]")
+    console.rule("[bold cyan]Phase 3 — Category-Based Trends[/bold cyan]")
 
     results = []
     csv_path = OUTPUT_DIR / "category_trends.csv"
@@ -839,16 +748,15 @@ def scrape_category_trends(checkpoint: Checkpoint, timeframes: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 – Master Keywords Aggregation
+# Phase 4 – Master Keywords Aggregation
 # ---------------------------------------------------------------------------
 
 def build_master_keywords(checkpoint: Checkpoint):
-    console.rule("[bold cyan]Phase 5 — Building Master Keywords List[/bold cyan]")
+    console.rule("[bold cyan]Phase 4 — Building Master Keywords List[/bold cyan]")
     all_kw: set[str] = set()
 
     sources = [
         ("related_queries.csv",  "query"),
-        ("related_topics.csv",   "topic_title"),
         ("trending_searches.csv","trending_keyword"),
         ("category_trends.csv",  "suggestion_title"),
     ]
@@ -887,7 +795,7 @@ def build_master_keywords(checkpoint: Checkpoint):
 def _run():
     parser = argparse.ArgumentParser(description="Google Trends LinkedIn Keywords Scraper")
     parser.add_argument("--status", action="store_true", help="Show checkpoint progress")
-    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4, 5],
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3, 4],
                         help="Run only a specific phase")
     args = parser.parse_args()
 
@@ -932,13 +840,12 @@ def _run():
     # -- run phases ----------------------------------------------------------
     phases = {
         1: ("Related Queries", scrape_related_queries),
-        2: ("Related Topics",  scrape_related_topics),
-        3: ("Trending RSS",    scrape_trending_rss),
-        4: ("Category Trends", scrape_category_trends),
+        2: ("Trending RSS",    scrape_trending_rss),
+        3: ("Category Trends", scrape_category_trends),
     }
 
     if args.phase:
-        if args.phase == 5:
+        if args.phase == 4:
             build_master_keywords(checkpoint)
         elif args.phase in phases:
             name, func = phases[args.phase]
