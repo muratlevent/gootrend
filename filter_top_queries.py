@@ -1,5 +1,14 @@
 import pandas as pd
 from pathlib import Path
+from collections import Counter
+import re
+
+def extract_ngrams(text, n):
+    """Bir metinden n-gram'ları çıkar."""
+    words = str(text).lower().split()
+    if len(words) < n:
+        return []
+    return [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
 
 def filter_top_queries():
     # Dosya yolları
@@ -15,64 +24,94 @@ def filter_top_queries():
     # CSV dosyasını oku
     df = pd.read_csv(input_path)
 
-    # Sadece 'type' sütunu 'top' olanları filtrele
-    top_df = df[df["type"] == "top"]
+    # 1. Sadece 'type' sütunu 'top' olanları filtrele
+    top_df = df[df["type"] == "top"].copy()
 
-    # İstenen sütunları seç
-    selected_columns = ["category_name", "type", "query", "value"]
-    
-    # Sütunların varlığını kontrol et
-    missing_cols = [col for col in selected_columns if col not in top_df.columns]
-    if missing_cols:
-        print(f"Hata: Dosyada şu sütunlar eksik: {missing_cols}")
-        return
-
-    # Aynı kategori ve aynı sorgu (exact match) olanlarda value'su en yüksek olanı tut
-    filtered_df = top_df[selected_columns].copy()
-    
-    # Value sütununu sayısal değere çevir
-    filtered_df["value"] = pd.to_numeric(filtered_df["value"], errors='coerce').fillna(0)
-    
-    # 1. Tekilleştirme
-    deduplicated_df = filtered_df.sort_values(by=["category_name", "query", "value"], ascending=[True, True, False]) \
-                                 .drop_duplicates(subset=["category_name", "query"], keep="first")
-
-    # 2. ALFABE KONTROLÜ (Sadece Latin Alfabesi)
-    import re
+    # 2. Sadece Latin alfabesi karakterleri, sayılar, boşluklar ve yaygın noktalama işaretleri
+    # Latin Extended (Örn: é, ö, ş) dahil
+    latin_pattern = re.compile(r'^[A-Za-z0-9\s\.,!\?\-\(\)\'\"&/@#\$%]+$')
     
     def is_latin_alphabet(text):
         if not isinstance(text, str) or text.strip() == "":
             return False
-        
-        # Sadece Latin alfabesi karakterleri, sayılar, boşluklar ve yaygın noktalama işaretleri
-        # Bu pattern Arapça, Çince, Kiril, Japonca vb. latin dışı alfabeleri eler.
-        # Latin Extended (Örn: é, ö, ş) gibi karakterleri de dahil etmek için [A-Za-zÀ-ÿ] kullanıyoruz.
-        latin_pattern = re.compile(r'^[A-Za-z0-9\s\.,!\?\-\(\)\'\"&/@#\$%]+$')
-        
-        # Eğer çok kesin bir İngilizce/Sayı/Simge kontrolü istiyorsanız üsttekini;
-        # Ama eğer içinde 'ö' veya 'é' olan latin kökenli kelimeler de kalsın derseniz alttakini kullanabiliriz.
-        # Sizin durumunuzda LinkedIn/İngilizce ağırlıklı olduğu için standart ASCII + Yaygın simgeler yeterli olacaktır.
-        
         return bool(latin_pattern.match(text))
 
-    print(f"Alfabe kontrolü yapılıyor (Latin dışı karakterler temizleniyor)...")
-    
+    # 3. Value sütununu sayısal değere çevir ve 10'un altındakileri filtrele
+    top_df["value"] = pd.to_numeric(top_df["value"], errors='coerce').fillna(0)
+    top_df = top_df[top_df["value"] >= 10]
+
+    # 4. Latin alfabesi kontrolü
+    print("Alfabe kontrolü yapılıyor...")
     from tqdm import tqdm
     tqdm.pandas()
+    top_df = top_df[top_df["query"].progress_apply(is_latin_alphabet)]
+
+    # 5. Aynı sorgu (exact match) olanlarda, kategoriye bakmaksızın en yüksek value'su olanı tut
+    print("Tekilleştirme yapılıyor (Kategori bağımsız)...")
+    # Önce value'ya göre büyükten küçüğe sıralıyoruz
+    deduplicated_df = top_df.sort_values(by=["query", "value"], ascending=[True, False]) \
+                             .drop_duplicates(subset=["query"], keep="first")
+
+    # ---------------------------------------------------------------
+    # 6. GRUPLAMA MANTIĞI (N-gram Analizi)
+    # ---------------------------------------------------------------
+    print("Gruplama için n-gram analizi yapılıyor...")
+    queries = deduplicated_df["query"].dropna().str.strip().str.lower().tolist()
     
-    is_latin_mask = deduplicated_df["query"].progress_apply(is_latin_alphabet)
+    trigram_counter = Counter()
+    bigram_counter = Counter()
+    unigram_counter = Counter()
 
-    final_df = deduplicated_df[is_latin_mask]
+    for q in queries:
+        trigram_counter.update(set(extract_ngrams(q, 3)))
+        bigram_counter.update(set(extract_ngrams(q, 2)))
+        unigram_counter.update(set(extract_ngrams(q, 1)))
 
-    # Son olarak genel query sıralamasını (A-Z) yap
-    sorted_df = final_df.sort_values(by="query", ascending=True)
-
-    # Sonucu kaydet
-    sorted_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    MIN_FREQ = 3
+    common_trigrams = {phrase for phrase, count in trigram_counter.items() if count >= MIN_FREQ}
+    common_bigrams  = {phrase for phrase, count in bigram_counter.items()  if count >= MIN_FREQ}
+    common_unigrams = {phrase for phrase, count in unigram_counter.items() if count >= MIN_FREQ}
     
-    print(f"İşlem tamamlandı!")
-    print(f"Başlangıç: {len(top_df)} | Tekilleştirme Sonrası: {len(deduplicated_df)} | İngilizce Filtresi Sonrası: {len(sorted_df)}")
-    print(f"Filtrelenmiş dosya şuraya kaydedildi: {output_path}")
+    STOP_WORDS = {
+        "the", "a", "an", "of", "in", "to", "for", "and", "or", "is", "it",
+        "on", "at", "by", "with", "from", "as", "are", "was", "be", "has",
+        "had", "have", "do", "does", "did", "not", "no", "but", "if", "can",
+        "will", "how", "what", "when", "where", "who", "which", "why",
+        "this", "that", "these", "those", "my", "your", "his", "her", "its",
+        "our", "their", "i", "you", "he", "she", "we", "they", "me", "us",
+        "vs", "top", "best", "new", "most", "about", "all", "more",
+    }
+    common_unigrams -= STOP_WORDS
+
+    def assign_group(query):
+        q = str(query).lower().strip()
+        matches_3 = [ng for ng in extract_ngrams(q, 3) if ng in common_trigrams]
+        if matches_3:
+            return max(matches_3, key=lambda x: trigram_counter[x])
+        matches_2 = [ng for ng in extract_ngrams(q, 2) if ng in common_bigrams]
+        if matches_2:
+            return max(matches_2, key=lambda x: bigram_counter[x])
+        matches_1 = [ng for ng in extract_ngrams(q, 1) if ng in common_unigrams]
+        if matches_1:
+            return max(matches_1, key=lambda x: unigram_counter[x])
+        return q
+
+    print("Gruplar atanıyor...")
+    deduplicated_df["group"] = deduplicated_df["query"].progress_apply(assign_group)
+
+    # ---------------------------------------------------------------
+    # 7. SIRALAMA VE KAYDETME
+    # ---------------------------------------------------------------
+    output_columns = ["group", "category_name", "type", "query", "value"]
+    final_df = deduplicated_df[output_columns].sort_values(by=["group", "query"], ascending=True)
+
+    final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
+    
+    print(f"\nİşlem tamamlandı!")
+    print(f"Başlangıç satır sayısı (top): {len(top_df)}")
+    print(f"Filtreleme & Tekilleştirme sonrası: {len(deduplicated_df)}")
+    print(f"Benzersiz grup sayısı: {final_df['group'].nunique()}")
+    print(f"Sonuç dosyası: {output_path}")
 
 if __name__ == "__main__":
     filter_top_queries()
