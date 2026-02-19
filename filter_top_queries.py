@@ -118,11 +118,19 @@ def filter_top_queries():
 
     final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
     
+    # 8. BENZERSİZ GRUPLARI .TXT OLARAK KAYDET
+    # ---------------------------------------------------------------
+    unique_groups = sorted(final_df["group"].unique())
+    txt_path = Path("output/unique_groups.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(", ".join([f'"{g}"' for g in unique_groups]))
+    
     print(f"\nİşlem tamamlandı!")
     print(f"Başlangıç satır sayısı (top): {len(top_df)}")
     print(f"Filtreleme & Tekilleştirme sonrası: {len(deduplicated_df)}")
-    print(f"Benzersiz grup sayısı: {final_df['group'].nunique()}")
+    print(f"Benzersiz grup sayısı: {len(unique_groups)}")
     print(f"Sonuç dosyası: {output_path}")
+    print(f"Grup listesi: {txt_path}")
 
 if __name__ == "__main__":
     filter_top_queries()
