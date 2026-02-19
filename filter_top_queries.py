@@ -99,6 +99,16 @@ def filter_top_queries():
     print("Gruplar atanıyor...")
     deduplicated_df["group"] = deduplicated_df["query"].progress_apply(assign_group)
 
+    # 6.5. GRUP FİLTRESİ: Sadece 1 adet satırı olan grupları sil
+    print("Benzersiz (tek kalan) gruplar temizleniyor...")
+    group_counts = deduplicated_df["group"].value_counts()
+    groups_to_keep = group_counts[group_counts > 1].index
+    deduplicated_df = deduplicated_df[deduplicated_df["group"].isin(groups_to_keep)]
+
+    # 6.6. 'Real Estate' içeren grupları temizle
+    print("'Real Estate' içeren gruplar siliniyor...")
+    deduplicated_df = deduplicated_df[~deduplicated_df["group"].str.contains("real estate", case=False, na=False)]
+
     # ---------------------------------------------------------------
     # 7. SIRALAMA VE KAYDETME
     # ---------------------------------------------------------------
