@@ -113,7 +113,8 @@ def filter_top_queries():
     # 7. SIRALAMA VE KAYDETME
     # ---------------------------------------------------------------
     output_columns = ["group", "category_name", "type", "query", "value"]
-    final_df = deduplicated_df[output_columns].sort_values(by=["group", "query"], ascending=True)
+    # Önce gruba (A-Z), sonra o grup içindeki value değerine (Z-A) göre sırala
+    final_df = deduplicated_df[output_columns].sort_values(by=["group", "value", "query"], ascending=[True, False, True])
 
     final_df.to_csv(output_path, index=False, encoding="utf-8-sig")
     
